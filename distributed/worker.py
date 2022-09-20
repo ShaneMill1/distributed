@@ -348,6 +348,11 @@ class Worker(BaseWorker, ServerNode):
     lifetime_restart: bool
         Whether or not to restart a worker after it has reached its lifetime
         Default False
+    thread_auto_interrupt: bool
+          Whether running threads might be interrupted with an injected exception.
+          Interruption can happen when a task is released, but is currently running. The
+          threads state will be set to exception and the task will usually end, rather
+          than running to completion.
     kwargs: optional
         Additional parameters to ServerNode constructor
 
@@ -495,6 +500,7 @@ class Worker(BaseWorker, ServerNode):
         memory_pause_fraction: float | Literal[False] | None = None,
         ###################################
         # Parameters to Server
+        thread_auto_interrupt: bool | None = None,
         **kwargs,
     ):
         if reconnect is not None:
@@ -639,6 +645,54 @@ class Worker(BaseWorker, ServerNode):
         self.connection_args = self.security.get_connection_args("worker")
 
         self.loop = self.io_loop = IOLoop.current()
+        self.memory_limit = parse_memory_limit(memory_limit, self.nthreads)
+
+        self.interruptor = (
+            thread_auto_interrupt
+            if thread_auto_interrupt is not None
+            else dask.config.get("distributed.worker.thread_auto_interrupt", False)
+        )
+        self.memory_target_fraction = (
+            memory_target_fraction
+            if memory_target_fraction is not None
+            else dask.config.get("distributed.worker.memory.target")
+        )
+        self.memory_spill_fraction = (
+            memory_spill_fraction
+            if memory_spill_fraction is not None
+            else dask.config.get("distributed.worker.memory.spill")
+        )
+        self.memory_pause_fraction = (
+            memory_pause_fraction
+            if memory_pause_fraction is not None
+            else dask.config.get("distributed.worker.memory.pause")
+        )
+
+        if isinstance(data, MutableMapping):
+            self.data = data
+        elif callable(data):
+            self.data = data()
+        elif isinstance(data, tuple):
+            self.data = data[0](**data[1])
+        elif self.memory_limit and (
+            self.memory_target_fraction or self.memory_spill_fraction
+        ):
+            from .spill import SpillBuffer
+
+            self.data = SpillBuffer(
+                os.path.join(self.local_directory, "storage"),
+                target=int(
+                    self.memory_limit
+                    * (self.memory_target_fraction or self.memory_spill_fraction)
+                )
+                or sys.maxsize,
+            )
+        else:
+            self.data = {}
+
+        self.actors = {}
+        self.loop = loop or IOLoop.current()
+        self.reconnect = reconnect
 
         # Common executors always available
         self.executors = {
@@ -1855,6 +1909,83 @@ class Worker(BaseWorker, ServerNode):
 
     def handle_worker_status_change(self, status: str, stimulus_id: str) -> None:
         new_status = Status.lookup[status]  # type: ignore
+    
+    def transition_rescheduled_next(self, ts, *, stimulus_id):
+        next_state = ts._next
+        recs = self.release_key(ts.key, reason=stimulus_id)
+        recs[ts] = next_state
+        return recs, []
+
+    def transition_cancelled_fetch(self, ts, *, stimulus_id):
+        if ts.done:
+            return {ts: "released"}, []
+        elif ts._previous == "flight":
+            ts.state = ts._previous
+            return {}, []
+        else:
+            assert ts._previous == "executing"
+            return {ts: ("resumed", "fetch")}, []
+
+    def transition_cancelled_resumed(self, ts, next, *, stimulus_id):
+        ts._next = next
+        ts.state = "resumed"
+        return {}, []
+
+    def transition_cancelled_waiting(self, ts, *, stimulus_id):
+        if ts.done:
+            return {ts: "released"}, []
+        elif ts._previous == "executing":
+            ts.state = ts._previous
+            return {}, []
+        else:
+            assert ts._previous == "flight"
+            return {ts: ("resumed", "waiting")}, []
+
+    def transition_cancelled_forgotten(self, ts, *, stimulus_id):
+        ts._next = "forgotten"
+        if not ts.done:
+            return {}, []
+        return {ts: "released"}, []
+
+    def transition_cancelled_released(self, ts, *, stimulus_id):
+        if not ts.done:
+            ts._next = "released"
+            return {}, []
+        next_state = ts._next
+        self._executing.discard(ts)
+        self._in_flight_tasks.discard(ts)
+
+        for resource, quantity in ts.resource_restrictions.items():
+            self.available_resources[resource] += quantity
+        recommendations = self.release_key(ts.key, reason=stimulus_id)
+        recommendations[ts] = next_state or "released"
+        return recommendations, []
+
+    def transition_executing_released(self, ts, *, stimulus_id):
+        ts._previous = ts.state
+        # See https://github.com/dask/distributed/pull/5046#discussion_r685093940
+        ts.state = "cancelled"
+        ts.done = False
+
+        if self.interruptor:
+            # task is released but still running - set thread exception
+            th = [th for th, k in self.active_threads.items() if k == ts.key]
+            # th might be empty if the task exited anyway in the meantime
+            if th:
+                logger.info("Interrupting thread %i for task %s", th[0], ts.key)
+                self.executor.interrupt(th[0])
+
+        return {}, []
+
+    def transition_long_running_memory(self, ts, value=no_value, *, stimulus_id):
+        self.executed_count += 1
+        return self.transition_generic_memory(ts, value=value, stimulus_id=stimulus_id)
+
+    def transition_generic_memory(self, ts, value=no_value, *, stimulus_id):
+        if value is no_value and ts.key not in self.data:
+            raise RuntimeError(
+                f"Tried to transition task {ts} to `memory` without data available"
+            )
 
         if (
             new_status == Status.closing_gracefully

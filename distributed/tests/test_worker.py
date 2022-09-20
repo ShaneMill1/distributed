@@ -55,6 +55,7 @@ from distributed.utils_test import (
     TaskStateMetadataPlugin,
     _LockedCommPool,
     assert_story,
+    async_wait_for,
     captured_logger,
     dec,
     div,
@@ -1927,6 +1928,138 @@ async def test_worker_descopes_data(c, s, a):
 
         def __init__(self):
             C.instances.add(self)
+
+def donothing():
+    import time
+
+    from distributed._concurrent_futures_thread import WorkerThreadInterrupt
+
+    try:
+        for _ in range(100):
+            time.sleep(0.01)
+        raise KeyboardInterrupt
+    except WorkerThreadInterrupt:
+        get_worker().attr = "Quitting"
+
+
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)], timeout=2)
+async def test_interrupt(c, s, w):
+    import concurrent.futures
+
+    w.interruptor = True
+    fut0 = c.submit(donothing)
+    await async_wait_for(lambda: bool(w.active_threads), 1)
+    fut1 = c.submit(lambda: True)  # blocked
+    await asyncio.sleep(0.01)
+    assert not fut1.done()
+    await fut0.cancel()
+    with pytest.raises(concurrent.futures.CancelledError):
+        await fut0
+    assert await fut1
+    await async_wait_for(lambda: getattr(w, "attr", None) == "Quitting", 1)
+
+
+def test_interrupt_sync():
+    client = Client(
+        processes=False, asynchronous=False, n_workers=1, threads_per_worker=1
+    )
+    client.cluster.workers[0].interruptor = True
+    import concurrent.futures
+    import time
+
+    fut0 = client.submit(donothing)
+    time.sleep(0.01)
+    fut1 = client.submit(lambda: True)  # blocked
+    assert not fut1.done()
+    fut0.cancel()
+    with pytest.raises(concurrent.futures.CancelledError):
+        fut0.result()
+
+    assert fut1.result()
+    assert client.cluster.workers[0].attr == "Quitting"
+
+
+@gen_cluster(client=True)
+async def test_story_with_deps(c, s, a, b):
+    """
+    Assert that the structure of the story does not change unintentionally and
+    expected subfields are actually filled
+    """
+    dep = c.submit(inc, 1, workers=[a.address])
+    res = c.submit(inc, dep, workers=[b.address])
+    await res
+    key = res.key
+
+    story = a.story(key)
+    assert story == []
+    story = b.story(key)
+
+    pruned_story = []
+    stimulus_ids = set()
+    # Story now includes randomized stimulus_ids and timestamps.
+    for msg in story:
+        assert isinstance(msg, tuple), msg
+        assert isinstance(msg[-1], float), msg
+        assert msg[-1] > time() - 60, msg
+        pruned_msg = list(msg)
+        stimulus_ids.add(msg[-2])
+        pruned_story.append(tuple(pruned_msg[:-2]))
+
+    assert len(stimulus_ids) == 3, stimulus_ids
+    stimulus_id = pruned_story[0][-1]
+    assert isinstance(stimulus_id, str)
+    assert stimulus_id.startswith("compute-task")
+    # This is a simple transition log
+    expected_story = [
+        (key, "compute-task"),
+        (key, "released", "waiting", {dep.key: "fetch"}),
+        (key, "waiting", "ready", {}),
+        (key, "ready", "executing", {}),
+        (key, "put-in-memory"),
+        (key, "executing", "memory", {}),
+    ]
+    assert pruned_story == expected_story
+
+    dep_story = dep.key
+
+    story = b.story(dep_story)
+    pruned_story = []
+    stimulus_ids = set()
+    for msg in story:
+        assert isinstance(msg, tuple), msg
+        assert isinstance(msg[-1], float), msg
+        assert msg[-1] > time() - 60, msg
+        pruned_msg = list(msg)
+        stimulus_ids.add(msg[-2])
+        pruned_story.append(tuple(pruned_msg[:-2]))
+
+    assert len(stimulus_ids) == 2, stimulus_ids
+    stimulus_id = pruned_story[0][-1]
+    assert isinstance(stimulus_id, str)
+    expected_story = [
+        (dep_story, "ensure-task-exists", "released"),
+        (dep_story, "released", "fetch", {}),
+        (
+            "gather-dependencies",
+            a.address,
+            {dep.key},
+        ),
+        (dep_story, "fetch", "flight", {}),
+        (
+            "request-dep",
+            a.address,
+            {dep.key},
+        ),
+        (
+            "receive-dep",
+            a.address,
+            {dep.key},
+        ),
+        (dep_story, "put-in-memory"),
+        (dep_story, "flight", "memory", {res.key: "ready"}),
+    ]
+    assert pruned_story == expected_story
+>>>>>>> 5f501823990b8b47c298d62fc1aeb5111c22e904
 
     def f(x):
         y = C()
